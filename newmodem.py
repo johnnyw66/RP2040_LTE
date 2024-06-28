@@ -29,7 +29,7 @@ async def heartbeat(led,gsm_cmd_queue):
         led.value = not led.value
         if (indicator_delay < 600 and not s):
             s = True
-            destphone="+447753432247"
+            destphone="+447753000000"
             msgtext=f"Hello World - I hope this works. {destphone}"
             print(f"send SMS '{msgtext}' to {destphone}")
             await gsm_cmd_queue.put(f'AT+CMGS="{destphone}"\r')
