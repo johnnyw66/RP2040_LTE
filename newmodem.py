@@ -1,3 +1,16 @@
+"""
+ Demo CircuitPython code for the iLabs Connectivity RP2040 LTE/WIFI/BLE board
+ At the time of writing there was no CircuitPython build for this particular board -
+ so I used the iLabs Connectivity RP2040 LTE version. This meant I had to define the pins for the ESP WiFi comms.
+ 
+ - Note the board, at the time was a Major version behind on its ESP-AT chip (a year out of date).
+ - My ESP-AT chip had version 2.3 and the current version at the time of buying the board was 3.3
+
+- The code demonstrates WiFi (MQTT over WiFi), SMS (sending and receiving) and HTTP requests over LTE.
+
+ John Wilson, Sussex 2024
+ 
+"""
 import board
 import busio
 import digitalio
@@ -9,17 +22,51 @@ from adafruit_espatcontrol import adafruit_espatcontrol
 
 import asyncio
 from queue import Queue
-# Get wifi and SMS phone details and more from a secrets.py file
+import binascii
+import json
+GRAB_WEB_PAGE_DEMO = True
+
+example_post= [
+        "ATE0\r\n",
+        "AT+CMEE=2\r\n",
+        "AT+ULSTFILE=\r\n",
+        'AT+URDFILE="postdata.txt"\r\n',
+        'AT+ULSTFILE=2,"result.txt"\r\n',
+        'AT+URDFILE="result.txt"\r\n',
+
+        'AT+URDFILE="postdata.txt"\r\n'
+        'AT+UDELFILE="postdata.txt"\r\n',
+        'AT+UDELFILE="postdata.txt"\r\n',
+        'AT+UDELFILE="postdata.txt"\r\n',
+        'AT+UDELFILE="postdata.txt"\r\n',
+        'AT+UDELFILE="postdata.txt"\r\n',
+        "AT+ULSTFILE=\r\n",
+        'AT+UDWNFILE="postdata.txt",11\r',
+        'Fello Curly\x1A',        
+        'AT+URDFILE="postdata.txt"\r\n'
+        "AT+UHTTP=0\r\n",
+        'AT+UHTTP=0,1,"httpbin.org"\r\n',
+        'AT+UHTTP=0,5,80\r\n',
+        'AT+UHTTPC=0,4,"/post","result.txt","postdata.txt",1\r\n'
+
+        ]
+ 
+# Get wifi details and more from a secrets.py file
 try:
     from secrets import secrets
 except ImportError:
     print("WiFi secrets are kept in secrets.py, please add them there!")
     secrets = {
-        "ssid":"YOUR_SSID",
-        "password":"YOUR_WIFI_PASSWORD",
-        "phone":"+447712345678",
-
-    }
+            "ssid":"xxxxx",
+            "password":"password",
+            "phone":"+4477500000",
+            "mqtt_host":"mqttHOST",
+            "mqtt_username":"USER",
+            "mqtt_password":"PWD",
+            "mqtt_port":1883
+            
+        }
+    
     #raise
 
 DELAY_BETWEEN_AT_COMMANDS = 1000
@@ -30,6 +77,32 @@ sms_message = None
 http_response = None
 http_response_size = 0
 
+class DongleStats:
+    
+    def __init__(self, name):
+        self.name = name
+        self.insms = 0
+        self.outsms = 0
+        self.time = 0
+        self.lastin = 0
+        self.lastout = 0
+        
+        
+    def update_time(self,t):
+        self.time = self.time + t
+        
+    def mark_insms(self, sms):
+        self.insms += 1
+        self.lastin = self.time
+        
+    
+    def mark_outsms(self, sms):
+        self.outsms += 1
+        self.lastout = self.time
+        
+    def __str__(self):
+        return f"{self.name}:{self.insms}:{self.lastin}:{self.outsms}:{self.lastout}:{self.time}"
+    
 class SMSMessage:
     def __init__(self, headers, message=''):
         self.headers = headers
@@ -37,7 +110,14 @@ class SMSMessage:
     
     def append(self, str):
         self.message += str
-
+        
+    def base64encode(self):
+        b64_string=str(binascii.b2a_base64(self.datify().encode('utf-8')).decode('utf-8').strip())
+        return b64_string
+   
+    def datify(self):
+        return f"{self.headers[0][1:-1]}:{self.headers[2][1:]}:{self.headers[3][:-3]}:{self.message[0:123]}"
+    
     def __str__(self):
         return f"SMSMessage: headers: {self.headers} msg: <{self.message}>"
 
@@ -46,24 +126,56 @@ async def quality_heartbeat(gsm_cmd_queue):
     while True:
         await asyncio.sleep_ms(QUALITY_HEARTBEAT)
         await gsm_cmd_queue.put(f'AT+CSQ\r\n')
+        
+def sms_sender_factory(gsm_cmd_queue, dongle_stats):
+    async def sms_send(destphone, msgtext):
+        print("sms_send-->",destphone, msgtext)
+        await gsm_cmd_queue.put(f'AT+CMGS="{destphone}"\r')
+        await gsm_cmd_queue.put(f'{msgtext}\x1A')
+        dongle_stats.mark_outsms("@TODO")
+        
+    return sms_send
 
+async def sms_send(gsm_cmd_queue, destphone, msgtext):
+    await gsm_cmd_queue.put(f'AT+CMGS="{destphone}"\r')
+    await gsm_cmd_queue.put(f'{msgtext}\x1A')
+
+async def post_web_page(gsm_cmd_queue,url):
+    grab_commands = [
+            'AT+UDELFILE="postdata.txt"\r\n',
+            'AT+UDWNFILE="postdata.txt",11\r',
+            'Fello Curly\x1A',
+            "AT+UHTTP=0\r\n",
+            f'AT+UHTTP=0,1,"{url}"\r\n',
+            'AT+UHTTP=0,5,80\r\n',
+            'AT+UHTTPC=0,4,"/post","result.txt","postdata.txt",1\r\n'
+                    
+        ]
+    print("GRAB WEB PAGE")
+    for command in grab_commands:
+        print(f"COMMAND {command}")
+        await gsm_command_queue.put(command)
+    
+               
 # Demonstrate scheduler is operational.
-async def heartbeat(led,gsm_cmd_queue):
+async def heartbeat(led, dongle_stats, gsm_cmd_queue):
     global indicator_delay
     s = False
+    sms_sender = sms_sender_factory(gsm_cmd_queue, dongle_stats)
+
     while True:
         await asyncio.sleep_ms(indicator_delay)
         led.value = not led.value
         if (indicator_delay < 600 and not s):
             s = True
             if True:
-                destphone= secrets['phone']
-                msgtext=f"WOW! Hello NEW NEW World - I hope this works. {destphone}"
-                print(f"send SMS '{msgtext}' to {destphone}")                
-                await gsm_cmd_queue.put(f'AT+CMGS="{destphone}"\r')
-                await gsm_cmd_queue.put(f'{msgtext}\x1A')
-                print("Initiate Grabbing Web Page over 4g")
-                await grab_web_page(gsm_cmd_queue)
+                destphone = secrets['phone']
+                msgtext=f"Our dongle named '{dongle_stats.name}', has just booted up."
+                print(f"send SMS '{msgtext}' to {destphone}")
+                await sms_sender(destphone, msgtext)
+                if (GRAB_WEB_PAGE_DEMO): 
+                    print("Initiate Grabbing Web Page over 4g")
+                    await post_web_page(gsm_cmd_queue, 'httpbin.org')
  
 
 async def gsm_networkconnection_loop(gsm_cmd_queue, delay_in_secs = 45):
@@ -98,7 +210,7 @@ async def uart_write_loop(uart, message_queue):
     print("uart_write_loop")
     while True:
         message = await message_queue.get()  # Wait for a message from the queue
-        print(f"WRITE <{message}>")
+        #print(f"WRITE <{message}>")
         uart.write(message.encode('utf-8'))  # Write message to UART
         await asyncio.sleep_ms(DELAY_BETWEEN_AT_COMMANDS)  # Wait for 2 seconds between messages
 
@@ -109,7 +221,7 @@ async def parse_responses(response, gsm_cmd_queue, sms_queue):
     global sms_message, http_response, http_response_size, indicator_delay
     
     params=response.split(',')
-    print(f"parse_responses: {params}")
+    #print(f"parse_responses: {params}")
     if http_response_size <= 0 and http_response is not None:
         print("FINAL>>>>>>",http_response)
         http_response = None
@@ -118,7 +230,7 @@ async def parse_responses(response, gsm_cmd_queue, sms_queue):
     if (http_response_size > 0):
         http_response += response
         http_response_size -= len(response)
-        print("LEN = ", len(response), "Remaining", http_response_size)
+        #print("LEN = ", len(response), "Remaining", http_response_size)
             
     if (sms_message is not None):
         # Building a text message after receiving an AT '+CMGR' response
@@ -163,8 +275,7 @@ async def parse_responses(response, gsm_cmd_queue, sms_queue):
     elif "+CMTI:" in params[0]:
         msgid = int(params[1])
         await gsm_cmd_queue.put(f'AT+CMGR={msgid}\r\n')
-        #await gsm_cmd_queue.put(f'AT+CMGD={msgid}\r\n')
-        await gsm_cmd_queue.put(f'AT+CMGD=1,4\r\n')
+        await gsm_cmd_queue.put(f'AT+CMGD={msgid}\r\n')
         
         
     elif "+CMGR" in params[0]:
@@ -196,60 +307,55 @@ async def grab_web_page(gsm_command_queue):
         print(f"COMMAND {command}")
         await gsm_command_queue.put(command)
     
+def form_at_esp_mqtt_credentials():
+    username = secrets["mqtt_username"]
+    password = secrets["mqtt_password"]
+    return f'AT+MQTTUSERCFG=0,1,"client_id_12","{username}","{password}",0,0,""'
+
+def form_at_esp_mqtt_connect():
+    host = secrets["mqtt_host"]
+    port = secrets["mqtt_port"]
+    reconnect = 1 # 1 or 0
+    return f'AT+MQTTCONN=0,"{host}",{port},{reconnect}'
+
+def form_at_esp_subscribe(topic):
+    return f'AT+MQTTSUB=0,"{topic}",1'
     
+def form_at_esp_publish(topic,data,qos=1,retain=0):
+    return f'AT+MQTTPUB=0,"{topic}","{data}",{qos},{retain}'
+
+# Not yet used - ESP AT latest versions
+def form_at_esp_prepublish(topic,data,qos=1,retain=0):
+    return f'AT+MQTTPUBRAW=0,"{topic}",{len(data)},{qos},{retain}'
+
+def form_at_esp_postpublish(data):
+    return f'{data}'
+
 async def main(client, gsm_command_queue):
-    start_up_commandsX= [
-        "ATE0\r\n",
-        "AT+CMEE=2\r\n",
-        "AT+ULSTFILE=\r\n",
-        'AT+URDFILE="postdata.txt"\r\n',
-        'AT+ULSTFILE=2,"result.txt"\r\n',
-        'AT+URDFILE="result.txt"\r\n',
-
-        'AT+URDFILE="postdata.txt"\r\n'
-        'AT+UDELFILE="postdata.txt"\r\n',
-        'AT+UDELFILE="postdata.txt"\r\n',
-        'AT+UDELFILE="postdata.txt"\r\n',
-        'AT+UDELFILE="postdata.txt"\r\n',
-        'AT+UDELFILE="postdata.txt"\r\n',
-        "AT+ULSTFILE=\r\n",
-        'AT+UDWNFILE="postdata.txt",11\r',
-        'Fello Curly\x1A',        
-        'AT+URDFILE="postdata.txt"\r\n'
-        "AT+UHTTP=0\r\n",
-        'AT+UHTTP=0,1,"httpbin.org"\r\n',
-        'AT+UHTTP=0,5,80\r\n',
-        'AT+UHTTPC=0,4,"/post","result.txt","postdata.txt",1\r\n'
-
-        ]
-    
+   
     start_up_commands = [
         "AT\r\n",
         "ATE0\r\n",
         "AT+CMGF=1\r\n",
         "AT+CMGD=1,4\r\n",
         "AT+CNMI=1,1\r\n",
-        "AT+CNMI?\r\n",
-        "AT+CFUN?\r\n",
+        #"AT+CNMI?\r\n",
+        #"AT+CFUN?\r\n",
         "AT+CRC=1\r\n",
 
-        #"AT+UCALLSTAT=1\r\n",
         "AT+CREG=1\r\n",
-        "AT+CREG?\r\n",
+        #"AT+CREG?\r\n",
         "AT+CEREG=2\r\n",
-        "AT+CEREG?\r\n",
-        "AT+CPMS?\r\n",
+        #"AT+CEREG?\r\n",
+        #"AT+CPMS?\r\n",
         
         
         
-        "ATS0=0\r\n",
-        "AT+CGACT=1,1\r\n",
-        "AT+CGDCONT?\r\n",
-        'AT+CGCONTRDP\r\n',
+        #"AT+CGACT=1,1\r\n",
+        #"AT+CGDCONT?\r\n",
+        #'AT+CGCONTRDP\r\n',
 
         "AT+CMEE=2\r\n",
-
-        #'AT+UDELFILE="postdata.txt"\r\n',
 
     ]
 
@@ -264,46 +370,146 @@ async def main(client, gsm_command_queue):
         print('Connection failed.')
         machine.reset()
         return
-    # Allow us to change link and force setup mode 
-    #option = Pin(10, mode=Pin.IN, pull=Pin.PULL_UP)
+
     while True:
         await asyncio.sleep(5)
         #if (option.value() == 0):
-        #    machine.reset()   
+        #    machine.reset()
+
+def build_mqtt_subscribe_message(data_string):
+        
+    # Example string
+    #data_string = '+MQTTSUBRECV:0,"torratorratorra",46,{"to":"+447753432247","message":"Hello World"}'
+
+    # Splitting the string based on commas
+    parts = data_string.split(',')
+
+    prefix = parts[0]  # +MQTTSUBRECV:0
+    topic = parts[1].strip('"')  # torratorratorra
+    msg_size_bytes = int(parts[2])  # 46
+
+    # Extracting JSON object
+    json_str = ','.join(parts[3:])  # Reconstruct the JSON string
+
+    # Calculate the size of the JSON string in bytes
+    json_size_calculated = len(json_str.encode('utf-8'))
 
 
-async def wifi_loop(esp):
+    # Print comparison
+    print(f"Provided Size: {msg_size_bytes} bytes")
+    print(f"Calculated Size: {json_size_calculated} bytes")
     
-    print("Resetting ESP module")
-    esp.hard_reset()
+    # Checking if they match
+    if msg_size_bytes != json_size_calculated:
+        print("WARNING ... Sizes do not match.")
+    
+    return topic, json_str
+    
+def update_esp32at_messages_factory(esp, sms_sender):
+    uart = esp._uart
+    async def update_espat():
+        nonlocal uart 
+        while True:
+            #print("update esp",uart.in_waiting)
+            if uart.in_waiting > 0:
+                data = uart.readline()
+                response = data.decode('utf-8')                
+                print(response)
+                if '+MQTTSUBRECV:' in response:
+                    topic, sub_message = build_mqtt_subscribe_message(response)
+                    print(topic, sub_message)
+                    json_message = json.loads(sub_message)
+                    print(json_message)
+                    await sms_sender(json_message["to"], json_message["message"])
 
+                            
+            await asyncio.sleep(1)
+    return  update_espat
+
+def update_dongle_status_factory(esp, dongle_stats, delay = 30):
+    print("update_dongle_status... ")
+    count = 1    
+         
+    async def update_dongle_status():
+        nonlocal count
+        while True:
+            print(f"Update DONGLE STATUS time: {dongle_stats.time}")
+            resp = esp.at_response(form_at_esp_publish(f"status/{dongle_stats.name}",f"{dongle_stats}"))
+            count = count + 1
+            dongle_stats.update_time(delay)
+            await asyncio.sleep(delay)
+            
+    return  update_dongle_status
+
+def wifi_init(esp):
+    esp.hard_reset()
+    print("Scanning for AP's")
+    # Some ESP do not return OK on AP Scan.
+    # See https://github.com/adafruit/Adafruit_CircuitPython_ESP_ATcontrol/issues/48
+    # Comment out the next 3 lines if you get a No OK response to AT+CWLAP
+    # secrets dictionary must contain 'ssid' and 'password' at a minimum
+
+    for ap in esp.scan_APs():
+        print(ap)
+    print("Checking connection...")
+    
+    esp.connect(secrets)
+    print("Connected to AT software version ", esp.version)
+    print("IP address ", esp.local_ip)
+    
+    print("SETTING MQTT CREDENTIALS")
+                
+    resp = esp.at_response(form_at_esp_mqtt_credentials())
+    print("MQTT CREDENTIALS RESPONSE",resp)
+                
+    print(" MQTT CONNECTING....")                
+    resp = esp.at_response(form_at_esp_mqtt_connect())
+    print("MQTT CONNECT RESPONSE",resp)
+    
+    print("MQTT SUBSCRIBING....")
+    resp = esp.at_response(form_at_esp_subscribe("torratorratorra"))
+    print("MQTT SUBSCRIBE",resp)
+    
+
+     
+async def wifi_loop(esp, dongle_stats, sms_sender, sms_queue):
+    
     first_pass = True
     while True:
         try:
+
             if first_pass:
-                # Some ESP do not return OK on AP Scan.
-                # See https://github.com/adafruit/Adafruit_CircuitPython_ESP_ATcontrol/issues/48
-                # Comment out the next 3 lines if you get a No OK response to AT+CWLAP
-                print("Scanning for AP's")
-                for ap in esp.scan_APs():
-                    print(ap)
-                print("Checking connection...")
-                # secrets dictionary must contain 'ssid' and 'password' at a minimum
-                print("Connecting...")
-                esp.connect(secrets)
-                print("Connected to AT software version ", esp.version)
-                print("IP address ", esp.local_ip)
+                print("FIRST PASS ON WIFI LOOP")
+                wifi_init(esp)
                 first_pass = False
-            print("Pinging 8.8.8.8...", end="")
-            print(esp.ping("8.8.8.8"))
-            await asyncio.sleep(10)
+                update_dongle_status = update_dongle_status_factory(esp, dongle_stats)
+                update_subscribe_messages = update_esp32at_messages_factory(esp, sms_sender)
+                
+                asyncio.create_task(update_dongle_status())
+                asyncio.create_task(update_subscribe_messages())
+                   
+            #print("Pinging 8.8.8.8...", end="")
+            #print(esp.ping("8.8.8.8"))
+            if (True):
+                sms = await sms_queue.get()
+                dongle_stats.mark_insms(sms)
+                message64 = sms.base64encode()
+                #b64_string=str(binascii.b2a_base64(message.encode('utf-8')).decode('utf-8').strip())
+                print("MESSAGE", sms, "MESSAGE64", message64)
+                resp = esp.at_response(form_at_esp_publish(f"smsgwin/{dongle_stats.name}",message64))
+                
+
         except (ValueError, RuntimeError, adafruit_espatcontrol.OKError) as e:
             print("Failed to get data, retrying\n", e)
             print("Resetting ESP module")
-            esp.hard_reset()
+            wifi_init(esp)
             continue
    
 # ***** Note  ******: Below
+# Portions of this example have been taken from iLabs website.
+# This is for demo purposes only - I certainly would not recommend using this code
+# for production/home use. I recommend you play with the code - understand what it is doing
+# and then proceed to completely rewrite it!
 # The unfriendly pin names are down to the firmware of CircuitPython I have blown
 # into my iLabs 'Challenger RP2040 Connectivity'. This board supports LTE/WiFi/BLE.
 # At the time - the only suitable firmware that existed was for the 'RP2040 Challanger LTE'
@@ -312,10 +518,13 @@ async def wifi_loop(esp):
 # For demonstration I also ping a DNS server over WiFi.
 
 # Fudges were needed for the ESP32 AT support.
-# Johnny Wilson - Brighton 2024
+# Johnny Wilson - Brighton,June 2024
+dongle_stats = DongleStats("dongle_esp32")
 
-print ("Test program start !")
-debugflag = False
+print (f"Test program start ! Dongle name: {dongle_stats.name}")
+debugflag = False	#Set this to True - if you want to debug ESP-AT commands.
+
+#  These pins are the serial uart pins to the ESP32-AT mpu. 
 TX = microcontroller.pin.GPIO16
 RX = microcontroller.pin.GPIO17
 resetpin = DigitalInOut(microcontroller.pin.GPIO24)
@@ -333,14 +542,7 @@ esp = adafruit_espatcontrol.ESP_ATcontrol(
    
 )
 
-#led = digitalio.DigitalInOut(microcontroller.pin.GPIO19)
-#led.direction = digitalio.Direction.OUTPUT
 
-#while True:
-#    led.value = not led.value
-#    time.sleep(0.5)
-    
-# LED
 led = digitalio.DigitalInOut(board.LED)
 led.direction = digitalio.Direction.OUTPUT
 
@@ -396,14 +598,16 @@ if not to_count:
 else:
     print ("\nModem started !")
 
+
 gsm_response_queue = Queue()
 gsm_command_queue = Queue()
 sms_queue = Queue()
 
-asyncio.create_task(heartbeat(led, gsm_command_queue))
+asyncio.create_task(heartbeat(led, dongle_stats, gsm_command_queue))
 asyncio.create_task(quality_heartbeat(gsm_command_queue))
 
-asyncio.create_task(wifi_loop(esp))
+asyncio.create_task(wifi_loop(esp, dongle_stats, sms_sender_factory(gsm_command_queue, dongle_stats), sms_queue))
+
 
 asyncio.create_task(uart_read_loop(uart, gsm_response_queue))
 asyncio.create_task(uart_write_loop(uart, gsm_command_queue))
@@ -415,15 +619,8 @@ try:
     
 
 finally:
-#     client.close()  # Prevent LmacRxBlk:1 errors
     asyncio.new_event_loop()
 
-#led = digitalio.DigitalInOut(microcontroller.pin.GPIO19)
-#led.direction = digitalio.Direction.OUTPUT
-
-#while True:
-#    led.value = not led.value
-#    time.sleep(0.5)
 
 
 
