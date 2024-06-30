@@ -1,5 +1,4 @@
 
-Initial
 
 Example Circuit Python code for the  'Connectivity RP2040 LTE/WIFI/BLE'.
 
