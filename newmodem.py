@@ -6,7 +6,7 @@
  - Note the board, at the time was a Major version behind on its ESP-AT chip (a year out of date).
  - My ESP-AT chip had version 2.3 and the current version at the time of buying the board was 3.3
 
-- The code demonstrates WiFi (MQTT over WiFi), SMS (sending and receiving) and HTTP requests over LTE.
+- The code demonstrates WiFi (MQTT over WiFi), SMS (sending and receiving) and HTTP requests over LTE and WiFi.
 
  John Wilson, Sussex 2024
  
@@ -24,7 +24,13 @@ import asyncio
 from queue import Queue
 import binascii
 import json
+import rtc
+import time
+
+
 GRAB_WEB_PAGE_DEMO = True
+PING_DEMO=True
+
 
 example_post= [
         "ATE0\r\n",
@@ -77,15 +83,31 @@ sms_message = None
 http_response = None
 http_response_size = 0
 
+
+def parse_iso8601(date_string):
+    year = int(date_string[0:4])
+    month = int(date_string[5:7])
+    day = int(date_string[8:10])
+    hour = int(date_string[11:13])
+    minute = int(date_string[14:16])
+    second = int(date_string[17:19])
+    # Assuming the timezone is fixed or you handle it separately
+    return time.struct_time((year, month, day, hour, minute, second, 0, 0, -1))
+
+def format_iso8601(t):
+    return '{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}'.format(t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
+
+
 class DongleStats:
     
-    def __init__(self, name):
+    def __init__(self, name, rtc):
         self.name = name
         self.insms = 0
         self.outsms = 0
         self.time = 0
         self.lastin = 0
         self.lastout = 0
+        self._rtc = rtc
         
         
     def update_time(self,t):
@@ -93,15 +115,15 @@ class DongleStats:
         
     def mark_insms(self, sms):
         self.insms += 1
-        self.lastin = self.time
+        self.lastin = format_iso8601(self._rtc.datetime)
         
     
     def mark_outsms(self, sms):
         self.outsms += 1
-        self.lastout = self.time
+        self.lastout = format_iso8601(self._rtc.datetime)
         
     def __str__(self):
-        return f"{self.name}:{self.insms}:{self.lastin}:{self.outsms}:{self.lastout}:{self.time}"
+        return f"{self.name}#{self.insms}#{self.lastin}#{self.outsms}#{self.lastout}#{format_iso8601(self._rtc.datetime)}"
     
 class SMSMessage:
     def __init__(self, headers, message=''):
@@ -116,7 +138,7 @@ class SMSMessage:
         return b64_string
    
     def datify(self):
-        return f"{self.headers[0][1:-1]}:{self.headers[2][1:]}:{self.headers[3][:-3]}:{self.message[0:123]}"
+        return f"{self.headers[0][1:-1]}:{self.headers[2][1:]}:{self.headers[3][:-6]}:{self.message[0:125]}"
     
     def __str__(self):
         return f"SMSMessage: headers: {self.headers} msg: <{self.message}>"
@@ -169,10 +191,7 @@ async def heartbeat(led, dongle_stats, gsm_cmd_queue):
         if (indicator_delay < 600 and not s):
             s = True
             if True:
-                destphone = secrets['phone']
-                msgtext=f"Our dongle named '{dongle_stats.name}', has just booted up."
-                print(f"send SMS '{msgtext}' to {destphone}")
-                await sms_sender(destphone, msgtext)
+                await sms_sender(secrets['phone'], f"Our dongle named '{dongle_stats.name}', has just booted up.")
                 if (GRAB_WEB_PAGE_DEMO): 
                     print("Initiate Grabbing Web Page over 4g")
                     await post_web_page(gsm_cmd_queue, 'httpbin.org')
@@ -207,10 +226,10 @@ async def response_handler(response_queue, message_queue, sms_queue):
 
 
 async def uart_write_loop(uart, message_queue):
-    print("uart_write_loop")
+    print("uart_write_loop", message_queue)
     while True:
         message = await message_queue.get()  # Wait for a message from the queue
-        #print(f"WRITE <{message}>")
+        #print(f"WRITE ",message_queue,f"<{message}>")
         uart.write(message.encode('utf-8'))  # Write message to UART
         await asyncio.sleep_ms(DELAY_BETWEEN_AT_COMMANDS)  # Wait for 2 seconds between messages
 
@@ -433,7 +452,7 @@ def update_dongle_status_factory(esp, dongle_stats, delay = 30):
     async def update_dongle_status():
         nonlocal count
         while True:
-            print(f"Update DONGLE STATUS time: {dongle_stats.time}")
+            print(f"Update DONGLE STATUS time: {dongle_stats.time}  publish:{dongle_stats}")
             resp = esp.at_response(form_at_esp_publish(f"status/{dongle_stats.name}",f"{dongle_stats}"))
             count = count + 1
             dongle_stats.update_time(delay)
@@ -441,6 +460,13 @@ def update_dongle_status_factory(esp, dongle_stats, delay = 30):
             
     return  update_dongle_status
 
+
+async def ping_demo():
+    while True:
+        print("Pinging 8.8.8.8...", end="")
+        print(esp.ping("8.8.8.8"))
+        await asyncio.sleep(10)
+      
 def wifi_init(esp):
     esp.hard_reset()
     print("Scanning for AP's")
@@ -487,9 +513,8 @@ async def wifi_loop(esp, dongle_stats, sms_sender, sms_queue):
                 
                 asyncio.create_task(update_dongle_status())
                 asyncio.create_task(update_subscribe_messages())
-                   
-            #print("Pinging 8.8.8.8...", end="")
-            #print(esp.ping("8.8.8.8"))
+                asyncio.create_task(ping_demo())
+                
             if (True):
                 sms = await sms_queue.get()
                 dongle_stats.mark_insms(sms)
@@ -504,7 +529,26 @@ async def wifi_loop(esp, dongle_stats, sms_sender, sms_queue):
             print("Resetting ESP module")
             wifi_init(esp)
             continue
-   
+        
+async def update_rtc(rtc, esp):
+    while True:
+        try:
+            urlreq='AT+HTTPCLIENT=2,0,"http://worldtimeapi.org/api/timezone/Europe/London","worldtimeapi.org","/",1'
+            resp = esp.at_response(urlreq).decode('utf-8')
+            stra = ','.join(resp.split(',')[1:])
+            jsonr = json.loads(stra)
+            print("JSON RESPONSE ", jsonr['datetime'])
+            dt = parse_iso8601(jsonr['datetime'])
+            rtc.datetime = dt
+            # 2024-07-03T16:01:31.572608+01:00
+            print(format_iso8601(rtc.datetime))
+
+        except Exception as e:
+            print("Exception ", e)
+            
+        print("update_rtc....")
+        await asyncio.sleep(10)
+        
 # ***** Note  ******: Below
 # Portions of this example have been taken from iLabs website.
 # This is for demo purposes only - I certainly would not recommend using this code
@@ -515,11 +559,17 @@ async def wifi_loop(esp, dongle_stats, sms_sender, sms_queue):
 # At the time - the only suitable firmware that existed was for the 'RP2040 Challanger LTE'
 #  - which only supported comms over LTE. This version was 'perfect' for SARA LTE modem
 # support. The demo sends and receives SMS as well as supporting HTTP POST over LTE.
+# HTTP GET over WiFi 
 # For demonstration I also ping a DNS server over WiFi.
 
 # Fudges were needed for the ESP32 AT support.
 # Johnny Wilson - Brighton,June 2024
-dongle_stats = DongleStats("dongle_esp32")
+
+    
+r = rtc.RTC()
+r.datetime = time.struct_time((2019, 5, 29, 15, 14, 15, 0, -1, -1))
+
+dongle_stats = DongleStats("dongleESP32", r)
 
 print (f"Test program start ! Dongle name: {dongle_stats.name}")
 debugflag = False	#Set this to True - if you want to debug ESP-AT commands.
@@ -603,10 +653,14 @@ gsm_response_queue = Queue()
 gsm_command_queue = Queue()
 sms_queue = Queue()
 
+
+
+
 asyncio.create_task(heartbeat(led, dongle_stats, gsm_command_queue))
 asyncio.create_task(quality_heartbeat(gsm_command_queue))
 
 asyncio.create_task(wifi_loop(esp, dongle_stats, sms_sender_factory(gsm_command_queue, dongle_stats), sms_queue))
+asyncio.create_task(update_rtc(r, esp))
 
 
 asyncio.create_task(uart_read_loop(uart, gsm_response_queue))
