@@ -6,3 +6,4 @@ Sends/Receives SMS and publish and subscribe using MQTT over WiFi - (using onboa
 Sends HTTP post requests over LTE using Sara-R412 uBlox modem.
 
 
+![Alt text](rp2040conn.jpg?raw=true "RP2040 Connect") 
