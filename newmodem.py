@@ -1,3 +1,4 @@
+
 """
  Demo CircuitPython code for the iLabs Connectivity RP2040 LTE/WIFI/BLE board
  At the time of writing there was no CircuitPython build for this particular board -
@@ -6,19 +7,21 @@
  - Note the board, at the time was a Major version behind on its ESP-AT chip (a year out of date).
  - My ESP-AT chip had version 2.3 and the current version at the time of buying the board was 3.3
 
-- The code demonstrates WiFi (MQTT over WiFi), SMS (sending and receiving) and HTTP requests over LTE and WiFi.
+- The code demonstrates WiFi (MQTT over WiFi), SMS (sending and receiving) and HTTP requests over LTE.
 
  John Wilson, Sussex 2024
  
 """
+import time
+
 import board
 import busio
 import digitalio
-import time
 import microcontroller
 from digitalio import DigitalInOut
 from digitalio import Direction
 from adafruit_espatcontrol import adafruit_espatcontrol
+import adafruit_ssd1306
 
 import asyncio
 from queue import Queue
@@ -26,10 +29,11 @@ import binascii
 import json
 import rtc
 import time
-
+from microcontroller import watchdog as wdt
+from watchdog import WatchDogMode
 
 GRAB_WEB_PAGE_DEMO = True
-PING_DEMO=True
+PING_DEMO=False
 
 
 example_post= [
@@ -83,6 +87,48 @@ sms_message = None
 http_response = None
 http_response_size = 0
 
+class MessageQueue:
+    def __init__(self):
+        self.queue = []
+        self.time = 0
+
+    def is_empty(self):
+        return len(self.queue) == 0
+
+    def enqueue(self, item):
+        self.queue.append(item)
+
+    def dequeue(self):
+        if not self.is_empty():
+            return self.queue.pop(0)
+        else:
+            raise IndexError("dequeue from an empty queue")
+
+    def peek(self):
+        if not self.is_empty():
+            return self.queue[0]
+        else:
+            raise IndexError("peek from an empty queue")
+
+    def get_top_messages(self, count = 4):
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        return self.queue[:count]
+
+    def size(self):
+        return len(self.queue)
+
+    def update(self, dt):
+        #print(len(self.queue))
+        if (len(self.queue) > 4):
+            self.dequeue()
+        self.time += dt
+
+    def get_time(self):
+        return self.time
+    
+    def __str__(self):
+        return "Queue: " + str(self.queue) + f"time: {self.time}"
 
 def parse_iso8601(date_string):
     year = int(date_string[0:4])
@@ -187,6 +233,8 @@ async def heartbeat(led, dongle_stats, gsm_cmd_queue):
 
     while True:
         await asyncio.sleep_ms(indicator_delay)
+        wdt.feed()
+        
         led.value = not led.value
         if (indicator_delay < 600 and not s):
             s = True
@@ -216,11 +264,47 @@ async def uart_read_loop(uart, response_queue):
             
         await asyncio.sleep_ms(1)  # Wait for 1 mseconds between messages
 
-async def response_handler(response_queue, message_queue, sms_queue):
+def get_datetime(r):
+    days = ("Mon", "Tues", "Wed", "Thur", "Fri", "Sat", "Sun")
+    t = r.datetime
+    date_str = f"{days[int(t.tm_wday)]} {t.tm_mday}/{t.tm_mon}/{t.tm_year}"
+    time_str = f"{t.tm_hour}:{t.tm_min:02}:{t.tm_sec:02}"
+    return date_str, time_str
+
+async def update_oled_display(oled, message_queue):
+    FONT_WIDTH = 5
+    PIXELS_PER__MS_SECOND = 1.5
+    start_time = time.monotonic()
+
+    while True:
+        if (oled):
+            oled.fill(0)
+            date_str, time_str = get_datetime(rtc.RTC())
+            oled.text( f"{date_str}" , 8, 8, 1)
+            oled.text( f"{time_str}" , 8, 16, 1)
+            time_ms  = message_queue.get_time()  # Get time passed in ms
+            #print("TIME IN MS",time_ms)
+            for i,m in enumerate(message_queue.get_top_messages()):
+                pixel_text_len = 128 + len(m) * FONT_WIDTH
+                pixels =  PIXELS_PER__MS_SECOND * time_ms 
+                pixels_mod = int(pixels) % pixel_text_len
+                oled.text( f"{m}" , 8 - pixels_mod + 128, 24+i*8, 1)
+            oled.show()
+
+        dt = 10 #(time.monotonic() - start_time) * 1000
+        #print("DT ", dt)
+        
+        message_queue.update(dt)
+        #print("OLED Message Queue", message_queue)
+        
+        await asyncio.sleep_ms(dt)
+        
+async def response_handler(response_queue, message_queue, sms_queue, oled_queue):
     print(f"response_handler queue = {response_queue}")
     while True:
         response = await response_queue.get()
-        await parse_responses(response, message_queue, sms_queue)
+        
+        await parse_responses(response, message_queue, sms_queue, oled_queue)
         await asyncio.sleep_ms(100)  # Wait for 1 seconds between messages
        
 
@@ -236,7 +320,7 @@ async def uart_write_loop(uart, message_queue):
 async def message_complete(message):
     print(f"{message}")
 
-async def parse_responses(response, gsm_cmd_queue, sms_queue):
+async def parse_responses(response, gsm_cmd_queue, sms_queue, oled_queue):
     global sms_message, http_response, http_response_size, indicator_delay
     
     params=response.split(',')
@@ -257,6 +341,7 @@ async def parse_responses(response, gsm_cmd_queue, sms_queue):
         if '\r\n' in response:
             #await message_complete(sms_message)
             print("message complete", sms_message)
+            oled_queue.enqueue(sms_message.message.strip())
             await sms_queue.put(SMSMessage(sms_message.headers, sms_message.message))
             #await reset_message_timer()
             sms_message = None
@@ -303,6 +388,8 @@ async def parse_responses(response, gsm_cmd_queue, sms_queue):
         
     elif "+COPS" in params[0] and "?" not in params[0]:
         print("COPS CHECK", len(params), params)
+        oled_queue.enqueue(params[2])
+        
         if (len(params) != 4):
             #raise NetworkException("Network Not Connected.")
             indicator_delay = 3000
@@ -497,7 +584,11 @@ def wifi_init(esp):
     print("MQTT SUBSCRIBE",resp)
     
 
-     
+def start_watchdog_timer():
+    print("<----------------SET WDT WDT WDT WDT WDT WDT WDT---------------->")
+    wdt.timeout=8 # Set a timeout of 8 seconds
+    wdt.mode = WatchDogMode.RESET   # WatchDogMode.RAISE to raise an exception
+    
 async def wifi_loop(esp, dongle_stats, sms_sender, sms_queue):
     
     first_pass = True
@@ -513,7 +604,9 @@ async def wifi_loop(esp, dongle_stats, sms_sender, sms_queue):
                 
                 asyncio.create_task(update_dongle_status())
                 asyncio.create_task(update_subscribe_messages())
-                asyncio.create_task(ping_demo())
+                if (PING_DEMO):
+                    asyncio.create_task(ping_demo())
+                #start_watchdog_timer()
                 
             if (True):
                 sms = await sms_queue.get()
@@ -547,7 +640,7 @@ async def update_rtc(rtc, esp):
             print("Exception ", e)
             
         print("update_rtc....")
-        await asyncio.sleep(10)
+        await asyncio.sleep(60)
         
 # ***** Note  ******: Below
 # Portions of this example have been taken from iLabs website.
@@ -565,9 +658,17 @@ async def update_rtc(rtc, esp):
 # Fudges were needed for the ESP32 AT support.
 # Johnny Wilson - Brighton,June 2024
 
-    
+OLED_WIDTH = 128
+OLED_HEIGHT = 64
+
 r = rtc.RTC()
-r.datetime = time.struct_time((2019, 5, 29, 15, 14, 15, 0, -1, -1))
+# r.datetime = time.struct_time((2019, 5, 29, 15, 14, 15, 0, -1, -1))
+try:
+    i2c = board.I2C()  # uses board.SCL and board.SDA
+    oled = adafruit_ssd1306.SSD1306_I2C(OLED_WIDTH, OLED_HEIGHT, i2c)
+except Exception as e:
+    oled = None
+    print(e)
 
 dongle_stats = DongleStats("dongleESP32", r)
 
@@ -653,8 +754,8 @@ gsm_response_queue = Queue()
 gsm_command_queue = Queue()
 sms_queue = Queue()
 
-
-
+message_queue = MessageQueue()
+message_queue.enqueue("WELCOME TO MESSAGE QUEUE")
 
 asyncio.create_task(heartbeat(led, dongle_stats, gsm_command_queue))
 asyncio.create_task(quality_heartbeat(gsm_command_queue))
@@ -665,8 +766,10 @@ asyncio.create_task(update_rtc(r, esp))
 
 asyncio.create_task(uart_read_loop(uart, gsm_response_queue))
 asyncio.create_task(uart_write_loop(uart, gsm_command_queue))
-asyncio.create_task(response_handler(gsm_response_queue, gsm_command_queue, sms_queue))
+asyncio.create_task(response_handler(gsm_response_queue, gsm_command_queue, sms_queue, message_queue))
 asyncio.create_task(gsm_networkconnection_loop(gsm_command_queue))
+asyncio.create_task(update_oled_display(oled, message_queue))
+
 
 try:
     asyncio.run(main(None, gsm_command_queue))
@@ -674,6 +777,10 @@ try:
 
 finally:
     asyncio.new_event_loop()
+
+
+
+
 
 
 
